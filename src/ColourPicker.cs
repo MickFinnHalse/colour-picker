@@ -1,6 +1,7 @@
-// Colour Picker: a small PowerPoint-style colour picker for Windows.
-// Spectrum + hue bar, Hex/RGB fields, screen eyedropper, standard and recent colours,
-// and a hex button that copies the code to the clipboard.
+// Colour Picker: a PowerPoint-style eyedropper for Windows.
+// Opens straight into a live eyedropper: move the pointer over anything on any screen,
+// a magnifier shows the colour and hex code, click to pick. Win+Shift+C picks again from anywhere.
+// Also: spectrum + hue bar, Hex/RGB fields, click-to-copy hex, standard and recent colours.
 // Built with the C# 5 compiler that ships with .NET Framework 4.x (see build.ps1).
 
 using System;
@@ -11,12 +12,13 @@ using System.Drawing.Imaging;
 using System.Globalization;
 using System.IO;
 using System.Runtime.InteropServices;
+using System.Threading;
 using System.Windows.Forms;
 
 [assembly: System.Reflection.AssemblyTitle("Colour Picker")]
 [assembly: System.Reflection.AssemblyProduct("Colour Picker")]
-[assembly: System.Reflection.AssemblyVersion("1.1.0.0")]
-[assembly: System.Reflection.AssemblyFileVersion("1.1.0.0")]
+[assembly: System.Reflection.AssemblyVersion("2.0.0.0")]
+[assembly: System.Reflection.AssemblyFileVersion("2.0.0.0")]
 
 namespace ColourPicker
 {
@@ -24,13 +26,32 @@ namespace ColourPicker
     {
         public static readonly IntPtr SystemAware = new IntPtr(-2);
         public static readonly IntPtr PerMonitorAwareV2 = new IntPtr(-4);
+        public static readonly IntPtr HWND_BROADCAST = new IntPtr(0xFFFF);
+        public const int WM_HOTKEY = 0x0312;
+        public const uint MOD_ALT = 1, MOD_CONTROL = 2, MOD_SHIFT = 4, MOD_WIN = 8, MOD_NOREPEAT = 0x4000;
+        const uint WDA_EXCLUDEFROMCAPTURE = 0x11;
+
         [DllImport("user32.dll")] public static extern bool SetProcessDpiAwarenessContext(IntPtr value);
         [DllImport("user32.dll")] public static extern IntPtr SetThreadDpiAwarenessContext(IntPtr value);
         [DllImport("user32.dll")] public static extern bool SetProcessDPIAware();
+        [DllImport("user32.dll")] static extern bool SetWindowDisplayAffinity(IntPtr hWnd, uint affinity);
+        [DllImport("user32.dll")] public static extern bool RegisterHotKey(IntPtr hWnd, int id, uint modifiers, uint vk);
+        [DllImport("user32.dll")] public static extern bool UnregisterHotKey(IntPtr hWnd, int id);
+        [DllImport("user32.dll", CharSet = CharSet.Unicode)] public static extern int RegisterWindowMessage(string name);
+        [DllImport("user32.dll")] public static extern bool PostMessage(IntPtr hWnd, int msg, IntPtr wParam, IntPtr lParam);
+        [DllImport("user32.dll")] public static extern bool AllowSetForegroundWindow(int processId);
+
+        // Keeps the eyedropper's own windows out of the pixels it reads (Windows 10 2004 and later).
+        public static void ExcludeFromCapture(IntPtr hWnd)
+        {
+            try { SetWindowDisplayAffinity(hWnd, WDA_EXCLUDEFROMCAPTURE); } catch { }
+        }
     }
 
     static class Program
     {
+        public static readonly int PickNowMessage = Native.RegisterWindowMessage("IllumiEd.ColourPicker.PickNow");
+
         [STAThread]
         static void Main()
         {
@@ -38,9 +59,21 @@ namespace ColourPicker
             // The eyedropper switches its own thread to per-monitor awareness to read real pixels.
             try { if (!Native.SetProcessDpiAwarenessContext(Native.SystemAware)) Native.SetProcessDPIAware(); }
             catch { try { Native.SetProcessDPIAware(); } catch { } }
-            Application.EnableVisualStyles();
-            Application.SetCompatibleTextRenderingDefault(false);
-            Application.Run(new MainForm());
+
+            bool first;
+            using (Mutex single = new Mutex(true, "Local\\IllumiEd.ColourPicker", out first))
+            {
+                if (!first)
+                {
+                    // Already running: opening it again starts the eyedropper in the running copy.
+                    Native.AllowSetForegroundWindow(-1);
+                    Native.PostMessage(Native.HWND_BROADCAST, PickNowMessage, IntPtr.Zero, IntPtr.Zero);
+                    return;
+                }
+                Application.EnableVisualStyles();
+                Application.SetCompatibleTextRenderingDefault(false);
+                Application.Run(new MainForm());
+            }
         }
     }
 
@@ -267,144 +300,163 @@ namespace ColourPicker
         }
     }
 
-    // Full-screen eyedropper over a frozen screenshot of every monitor, with a magnifier.
-    // Created while the thread is per-monitor DPI aware, so its pixels are real screen pixels.
-    class PickOverlay : Form
+    // The magnifier that follows the pointer. Click-through, never takes focus,
+    // and kept out of screen capture so it never appears in the pixels being read.
+    class Loupe : Form
     {
-        readonly Bitmap shot;
-        readonly Rectangle vs;
+        public const int Half = 5, N = 2 * Half + 1; // 11 x 11 pixels
         readonly float scale;
-        readonly int cell;
-        const int Half = 5; // 11 x 11 pixels in the magnifier
-        Point cur;
-        Rectangle help;
-        bool pressed;
-        public Color Picked;
+        readonly int cell, strip;
+        readonly Color[] px = new Color[N * N];
+        readonly Font hexFont, tipFont;
 
-        public PickOverlay(Bitmap shot, Rectangle virtualScreen, float scale)
+        public Loupe(float scale)
         {
-            this.shot = shot;
-            vs = virtualScreen;
             this.scale = scale;
-            cell = (int)Math.Round(12 * scale);
+            cell = P(12);
+            strip = P(46);
             AutoScaleMode = AutoScaleMode.None;
             FormBorderStyle = FormBorderStyle.None;
             StartPosition = FormStartPosition.Manual;
             ShowInTaskbar = false;
             ShowIcon = false;
             TopMost = true;
-            // Painted through a small per-paint buffer instead of a screen-sized double buffer.
-            SetStyle(ControlStyles.AllPaintingInWmPaint | ControlStyles.UserPaint | ControlStyles.Opaque, true);
-            Cursor = Cursors.Cross;
-            Text = "Pick a colour";
-            Bounds = vs;
-            Point p = Cursor.Position;
-            cur = new Point(p.X - vs.X, p.Y - vs.Y);
-
-            Rectangle mon = Screen.FromPoint(p).Bounds;
-            int hw = P(440), hh = P(34);
-            help = new Rectangle(mon.X - vs.X + (mon.Width - hw) / 2, mon.Y - vs.Y + P(16), hw, hh);
+            DoubleBuffered = true;
+            Opacity = 0.99; // makes it a layered window, so WS_EX_TRANSPARENT lets clicks pass through
+            ClientSize = new Size(N * cell + 2, N * cell + 2 + strip);
+            hexFont = new Font("Consolas", 12f, FontStyle.Bold);
+            tipFont = new Font("Segoe UI", 8f);
+            for (int i = 0; i < px.Length; i++) px[i] = Color.Gray;
         }
 
         int P(double v) { return (int)Math.Round(v * scale); }
 
-        protected override void OnShown(EventArgs e) { base.OnShown(e); Activate(); }
+        protected override bool ShowWithoutActivation { get { return true; } }
 
-        // If something else takes focus (Alt+Tab, a notification), cancel rather than pick on the next click.
-        protected override void OnDeactivate(EventArgs e)
+        protected override CreateParams CreateParams
         {
-            base.OnDeactivate(e);
-            if (Visible && DialogResult == DialogResult.None) DialogResult = DialogResult.Cancel;
+            get
+            {
+                CreateParams cp = base.CreateParams;
+                cp.ExStyle |= 0x20 /* WS_EX_TRANSPARENT */ | 0x80 /* WS_EX_TOOLWINDOW */ | 0x08000000 /* WS_EX_NOACTIVATE */;
+                return cp;
+            }
         }
 
-        Color PixelAt(int x, int y)
-        {
-            if (x < 0 || y < 0 || x >= shot.Width || y >= shot.Height) return Color.Gray;
-            Color c = shot.GetPixel(x, y);
-            return Color.FromArgb(c.R, c.G, c.B);
-        }
+        protected override void OnHandleCreated(EventArgs e) { base.OnHandleCreated(e); Native.ExcludeFromCapture(Handle); }
 
-        Rectangle Loupe()
-        {
-            int size = (2 * Half + 1) * cell + 2;
-            int lh = size + P(30);
-            Rectangle mon = Screen.FromPoint(new Point(cur.X + vs.X, cur.Y + vs.Y)).Bounds;
-            mon.Offset(-vs.X, -vs.Y);
-            int x = cur.X + P(22), y = cur.Y + P(22);
-            if (x + size > mon.Right) x = cur.X - P(22) - size;
-            if (y + lh > mon.Bottom) y = cur.Y - P(22) - lh;
-            return new Rectangle(x, y, size, lh);
-        }
+        public Color Centre { get { return px[Half * N + Half]; } }
 
-        protected override void OnPaintBackground(PaintEventArgs e) { }
+        public void ShowSample(Bitmap sample, Point cursor)
+        {
+            for (int y = 0; y < N; y++)
+                for (int x = 0; x < N; x++)
+                {
+                    Color c = sample.GetPixel(x, y);
+                    px[y * N + x] = Color.FromArgb(c.R, c.G, c.B);
+                }
+            Rectangle mon = Screen.FromPoint(cursor).Bounds;
+            int x0 = cursor.X + P(24), y0 = cursor.Y + P(24);
+            if (x0 + Width > mon.Right) x0 = cursor.X - P(24) - Width;
+            if (y0 + Height > mon.Bottom) y0 = cursor.Y - P(24) - Height;
+            Location = new Point(x0, y0);
+            Invalidate();
+        }
 
         protected override void OnPaint(PaintEventArgs e)
         {
-            Rectangle clip = Rectangle.Intersect(e.ClipRectangle, ClientRectangle);
-            if (clip.Width <= 0 || clip.Height <= 0) return;
-            using (Bitmap buf = new Bitmap(clip.Width, clip.Height, PixelFormat.Format32bppPArgb))
-            {
-                using (Graphics g = Graphics.FromImage(buf))
-                {
-                    g.TranslateTransform(-clip.X, -clip.Y);
-                    Draw(g, clip);
-                }
-                e.Graphics.DrawImageUnscaled(buf, clip.X, clip.Y);
-            }
-        }
-
-        void Draw(Graphics g, Rectangle clip)
-        {
-            g.DrawImage(shot, clip, clip, GraphicsUnit.Pixel);
-
-            // Instructions
-            if (help.IntersectsWith(clip))
-            {
-                using (SolidBrush bg = new SolidBrush(Color.FromArgb(235, 28, 30, 36)))
-                    g.FillRectangle(bg, help);
-                using (Font f = new Font("Segoe UI", 10f))
-                using (StringFormat sf = new StringFormat { Alignment = StringAlignment.Center, LineAlignment = StringAlignment.Center })
-                    g.DrawString("Click to pick  ·  Arrow keys nudge  ·  Enter picks  ·  Esc cancels", f, Brushes.White, help, sf);
-            }
-
-            // Magnifier
-            Rectangle L = Loupe();
-            if (!L.IntersectsWith(clip)) return;
-            g.FillRectangle(Brushes.White, L);
-            int ox = L.X + 1, oy = L.Y + 1;
-            for (int dy = -Half; dy <= Half; dy++)
-                for (int dx = -Half; dx <= Half; dx++)
-                    using (SolidBrush b = new SolidBrush(PixelAt(cur.X + dx, cur.Y + dy)))
-                        g.FillRectangle(b, ox + (dx + Half) * cell, oy + (dy + Half) * cell, cell, cell);
+            Graphics g = e.Graphics;
+            g.Clear(Color.White);
+            for (int y = 0; y < N; y++)
+                for (int x = 0; x < N; x++)
+                    using (SolidBrush b = new SolidBrush(px[y * N + x]))
+                        g.FillRectangle(b, 1 + x * cell, 1 + y * cell, cell, cell);
             using (Pen grid = new Pen(Color.FromArgb(50, 0, 0, 0)))
-                for (int i = 1; i < 2 * Half + 1; i++)
+                for (int i = 1; i < N; i++)
                 {
-                    g.DrawLine(grid, ox + i * cell, oy, ox + i * cell, oy + (2 * Half + 1) * cell);
-                    g.DrawLine(grid, ox, oy + i * cell, ox + (2 * Half + 1) * cell, oy + i * cell);
+                    g.DrawLine(grid, 1 + i * cell, 1, 1 + i * cell, 1 + N * cell);
+                    g.DrawLine(grid, 1, 1 + i * cell, 1 + N * cell, 1 + i * cell);
                 }
-            Rectangle cr = new Rectangle(ox + Half * cell, oy + Half * cell, cell, cell);
+            Rectangle cr = new Rectangle(1 + Half * cell, 1 + Half * cell, cell, cell);
             g.DrawRectangle(Pens.Black, cr);
             cr.Inflate(-1, -1);
             g.DrawRectangle(Pens.White, cr);
 
-            Color c = PixelAt(cur.X, cur.Y);
-            Rectangle strip = new Rectangle(L.X, L.Bottom - P(30), L.Width, P(30));
-            using (SolidBrush sb = new SolidBrush(Color.FromArgb(28, 30, 36))) g.FillRectangle(sb, strip);
-            Rectangle sw = new Rectangle(strip.X + P(8), strip.Y + P(7), P(16), P(16));
-            using (SolidBrush cb = new SolidBrush(c)) g.FillRectangle(cb, sw);
+            Rectangle bar = new Rectangle(0, ClientSize.Height - strip, ClientSize.Width, strip);
+            using (SolidBrush sb = new SolidBrush(Color.FromArgb(28, 30, 36))) g.FillRectangle(sb, bar);
+            Rectangle sw = new Rectangle(P(8), bar.Y + P(6), P(18), P(18));
+            using (SolidBrush cb = new SolidBrush(Centre)) g.FillRectangle(cb, sw);
             g.DrawRectangle(Pens.White, sw);
-            using (Font f = new Font("Consolas", 11f, FontStyle.Bold))
-            using (StringFormat sf = new StringFormat { LineAlignment = StringAlignment.Center })
-                g.DrawString(Col.Hex(c), f, Brushes.White, new Rectangle(sw.Right + P(8), strip.Y, strip.Width - P(40), strip.Height), sf);
-            using (Pen border = new Pen(Color.FromArgb(28, 30, 36))) g.DrawRectangle(border, L.X, L.Y, L.Width - 1, L.Height - 1);
+            g.DrawString(Col.Hex(Centre), hexFont, Brushes.White, sw.Right + P(6), bar.Y + P(4));
+            using (SolidBrush tip = new SolidBrush(Color.FromArgb(190, 196, 206)))
+                g.DrawString("Click to pick · Esc cancels", tipFont, tip, P(7), bar.Y + P(27));
+            using (Pen border = new Pen(Color.FromArgb(28, 30, 36))) g.DrawRectangle(border, 0, 0, ClientSize.Width - 1, ClientSize.Height - 1);
         }
 
-        protected override void OnMouseMove(MouseEventArgs e)
+        protected override void Dispose(bool disposing)
         {
-            Rectangle old = Loupe();
-            cur = e.Location;
-            Invalidate(old);
-            Invalidate(Loupe());
+            if (disposing) { hexFont.Dispose(); tipFont.Dispose(); }
+            base.Dispose(disposing);
+        }
+    }
+
+    // Live eyedropper: a nearly invisible window over every monitor catches the click,
+    // while the screen underneath keeps updating and is read pixel by pixel as the pointer moves.
+    // Created while the thread is per-monitor DPI aware, so coordinates are real screen pixels.
+    class Eyedropper : Form
+    {
+        readonly Loupe loupe;
+        readonly System.Windows.Forms.Timer timer = new System.Windows.Forms.Timer();
+        readonly Bitmap sample = new Bitmap(Loupe.N, Loupe.N, PixelFormat.Format32bppRgb);
+        bool pressed;
+        public Color Picked;
+
+        public Eyedropper(Rectangle virtualScreen, float scale)
+        {
+            AutoScaleMode = AutoScaleMode.None;
+            FormBorderStyle = FormBorderStyle.None;
+            StartPosition = FormStartPosition.Manual;
+            ShowInTaskbar = false;
+            ShowIcon = false;
+            TopMost = true;
+            BackColor = Color.Black;
+            Opacity = 0.01; // invisible to the eye, but still receives the mouse
+            Cursor = Cursors.Cross;
+            Text = "Pick a colour";
+            Bounds = virtualScreen;
+            loupe = new Loupe(scale);
+            timer.Interval = 30;
+            timer.Tick += delegate { Sample(); };
+        }
+
+        protected override void OnHandleCreated(EventArgs e) { base.OnHandleCreated(e); Native.ExcludeFromCapture(Handle); }
+
+        protected override void OnShown(EventArgs e)
+        {
+            base.OnShown(e);
+            Sample();
+            loupe.Show(this);
+            Activate();
+            timer.Start();
+        }
+
+        void Sample()
+        {
+            Point p = Cursor.Position;
+            try
+            {
+                using (Graphics g = Graphics.FromImage(sample))
+                    g.CopyFromScreen(p.X - Loupe.Half, p.Y - Loupe.Half, 0, 0, new Size(Loupe.N, Loupe.N), CopyPixelOperation.SourceCopy);
+            }
+            catch (System.ComponentModel.Win32Exception) { return; } // e.g. a secure desktop prompt is showing
+            loupe.ShowSample(sample, p);
+        }
+
+        void Finish(DialogResult result)
+        {
+            if (DialogResult != DialogResult.None) return;
+            if (result == DialogResult.OK) { Sample(); Picked = loupe.Centre; }
+            DialogResult = result;
         }
 
         // Act on release, not press, so the release doesn't fall through to the window underneath.
@@ -413,8 +465,14 @@ namespace ColourPicker
         protected override void OnMouseUp(MouseEventArgs e)
         {
             if (!pressed) return;
-            if (e.Button == MouseButtons.Left) { Picked = PixelAt(e.X, e.Y); DialogResult = DialogResult.OK; }
-            else DialogResult = DialogResult.Cancel;
+            Finish(e.Button == MouseButtons.Left ? DialogResult.OK : DialogResult.Cancel);
+        }
+
+        // If something else takes focus (Alt+Tab, a notification), cancel rather than pick on the next click.
+        protected override void OnDeactivate(EventArgs e)
+        {
+            base.OnDeactivate(e);
+            if (Visible) Finish(DialogResult.Cancel);
         }
 
         protected override bool ProcessCmdKey(ref Message msg, Keys keyData)
@@ -424,14 +482,27 @@ namespace ColourPicker
             Point p = Cursor.Position;
             switch (k)
             {
-                case Keys.Escape: DialogResult = DialogResult.Cancel; return true;
-                case Keys.Enter: Picked = PixelAt(cur.X, cur.Y); DialogResult = DialogResult.OK; return true;
+                case Keys.Escape: Finish(DialogResult.Cancel); return true;
+                case Keys.Enter: case Keys.Space: Finish(DialogResult.OK); return true;
                 case Keys.Left: Cursor.Position = new Point(p.X - step, p.Y); return true;
                 case Keys.Right: Cursor.Position = new Point(p.X + step, p.Y); return true;
                 case Keys.Up: Cursor.Position = new Point(p.X, p.Y - step); return true;
                 case Keys.Down: Cursor.Position = new Point(p.X, p.Y + step); return true;
             }
             return base.ProcessCmdKey(ref msg, keyData);
+        }
+
+        protected override void OnFormClosed(FormClosedEventArgs e)
+        {
+            timer.Stop();
+            loupe.Close();
+            base.OnFormClosed(e);
+        }
+
+        protected override void Dispose(bool disposing)
+        {
+            if (disposing) { timer.Dispose(); loupe.Dispose(); sample.Dispose(); }
+            base.Dispose(disposing);
         }
     }
 
@@ -440,10 +511,12 @@ namespace ColourPicker
         // Office's ten standard colours, as in PowerPoint's colour menu
         static readonly string[] Standard = { "#C00000", "#FF0000", "#FFC000", "#FFFF00", "#92D050", "#00B050", "#00B0F0", "#0070C0", "#002060", "#7030A0" };
         const int MaxRecent = 12;
+        const int HotkeyId = 1;
 
         float S = 1f;
         double H, Sa, V;
-        bool updating;
+        bool updating, picking;
+        string hotkeyName;
         readonly List<string> recent = new List<string>();
         readonly string settingsPath = Path.Combine(Environment.GetFolderPath(Environment.SpecialFolder.LocalApplicationData), "ColourPicker", "settings.txt");
 
@@ -451,12 +524,12 @@ namespace ColourPicker
         HueBar hueBar;
         Panel preview, recentPanel;
         Button hexBtn, pickBtn, copyRgbBtn;
-        Label copyHint, recentEmpty;
+        Label copyHint, recentEmpty, hotkeyLabel;
         TextBox hexBox;
         NumericUpDown nR, nG, nB;
-        CheckBox topBox;
+        CheckBox topBox, startBox;
         ToolTip tips = new ToolTip();
-        Timer hintTimer = new Timer();
+        System.Windows.Forms.Timer hintTimer = new System.Windows.Forms.Timer();
 
         int P(double v) { return (int)Math.Round(v * S); }
         Rectangle R(int x, int y, int w, int h) { return new Rectangle(P(x), P(y), P(w), P(h)); }
@@ -471,30 +544,30 @@ namespace ColourPicker
             KeyPreview = true;
             Font = new Font("Segoe UI", 9f);
             try { Icon = Icon.ExtractAssociatedIcon(Application.ExecutablePath); } catch { }
-            ClientSize = new Size(P(470), P(432));
+            ClientSize = new Size(P(470), P(458));
 
-            spec = new SpectrumBox { Bounds = R(12, 12, 260, 220), TabIndex = 0 };
-            hueBar = new HueBar { Bounds = R(282, 12, 22, 220), TabIndex = 1 };
+            spec = new SpectrumBox { Bounds = R(12, 12, 260, 220), TabIndex = 10 };
+            hueBar = new HueBar { Bounds = R(282, 12, 22, 220), TabIndex = 11 };
             tips.SetToolTip(spec, "Drag to choose saturation and brightness. Arrow keys fine-tune.");
             tips.SetToolTip(hueBar, "Drag to choose the hue. Up and Down keys fine-tune.");
 
-            preview = new Panel { Bounds = R(316, 12, 142, 72), BorderStyle = BorderStyle.FixedSingle, Cursor = Cursors.Hand, AccessibleName = "Colour preview, click to copy" };
+            pickBtn = new Button { Bounds = R(316, 12, 142, 44), Text = "&Pick from screen", Font = new Font("Segoe UI", 10f, FontStyle.Bold), TabIndex = 0 };
+            tips.SetToolTip(pickBtn, "Eyedropper: point at anything on any screen and click to pick its colour");
+            pickBtn.Click += delegate { Pick(); };
+
+            preview = new Panel { Bounds = R(316, 64, 142, 58), BorderStyle = BorderStyle.FixedSingle, Cursor = Cursors.Hand, AccessibleName = "Colour preview, click to copy" };
             tips.SetToolTip(preview, "Click to copy the hex code");
             // Moving focus first commits any half-typed R, G or B value.
             preview.Click += delegate { hexBtn.Focus(); CopyHex(); };
 
-            hexBtn = new Button { Bounds = R(316, 92, 142, 40), Font = new Font("Consolas", 14f, FontStyle.Bold), FlatStyle = FlatStyle.Flat, Cursor = Cursors.Hand, TabIndex = 2, UseMnemonic = false };
+            hexBtn = new Button { Bounds = R(316, 130, 142, 40), Font = new Font("Consolas", 14f, FontStyle.Bold), FlatStyle = FlatStyle.Flat, Cursor = Cursors.Hand, TabIndex = 1, UseMnemonic = false };
             hexBtn.FlatAppearance.BorderColor = SystemColors.ControlDark;
             tips.SetToolTip(hexBtn, "Click to copy the hex code (Ctrl+C)");
             hexBtn.Click += delegate { CopyHex(); };
 
-            copyHint = new Label { Bounds = R(316, 134, 142, 20), Text = "Click to copy", TextAlign = ContentAlignment.MiddleCenter, ForeColor = SystemColors.GrayText };
+            copyHint = new Label { Bounds = R(316, 172, 142, 20), Text = "Click to copy", TextAlign = ContentAlignment.MiddleCenter, ForeColor = SystemColors.GrayText };
 
-            pickBtn = new Button { Bounds = R(316, 160, 142, 34), Text = "&Pick from screen", TabIndex = 3 };
-            tips.SetToolTip(pickBtn, "Eyedropper: pick a colour from anywhere on any screen");
-            pickBtn.Click += delegate { Pick(); };
-
-            copyRgbBtn = new Button { Bounds = R(316, 202, 142, 30), Text = "Copy &RGB", TabIndex = 4 };
+            copyRgbBtn = new Button { Bounds = R(316, 202, 142, 30), Text = "Copy &RGB", TabIndex = 2 };
             tips.SetToolTip(copyRgbBtn, "Copy as R, G, B numbers, e.g. 68, 114, 196");
             copyRgbBtn.Click += delegate
             {
@@ -504,9 +577,9 @@ namespace ColourPicker
             };
 
             Controls.Add(new Label { Text = "Hex", Bounds = R(12, 250, 30, 20), TextAlign = ContentAlignment.MiddleLeft });
-            hexBox = new TextBox { Bounds = R(44, 248, 84, 24), Font = new Font("Consolas", 10f), CharacterCasing = CharacterCasing.Upper, MaxLength = 32, TabIndex = 5, AccessibleName = "Hex code" };
+            hexBox = new TextBox { Bounds = R(44, 248, 84, 24), Font = new Font("Consolas", 10f), CharacterCasing = CharacterCasing.Upper, MaxLength = 32, TabIndex = 12, AccessibleName = "Hex code" };
             tips.SetToolTip(hexBox, "Type or paste a hex code, e.g. #4472C4");
-            nR = MakeNum(156, 6, "Red"); nG = MakeNum(238, 7, "Green"); nB = MakeNum(320, 8, "Blue");
+            nR = MakeNum(156, 13, "Red"); nG = MakeNum(238, 14, "Green"); nB = MakeNum(320, 15, "Blue");
             Controls.Add(new Label { Text = "R", Bounds = R(140, 250, 16, 20), TextAlign = ContentAlignment.MiddleLeft });
             Controls.Add(new Label { Text = "G", Bounds = R(222, 250, 16, 20), TextAlign = ContentAlignment.MiddleLeft });
             Controls.Add(new Label { Text = "B", Bounds = R(304, 250, 16, 20), TextAlign = ContentAlignment.MiddleLeft });
@@ -524,10 +597,12 @@ namespace ColourPicker
             recentPanel = new Panel { Bounds = R(12, 366, 450, 32), TabIndex = 40 };
             recentEmpty = new Label { Text = "Colours you copy or pick will appear here.", Bounds = new Rectangle(0, P(6), P(440), P(20)), ForeColor = SystemColors.GrayText };
 
-            topBox = new CheckBox { Text = "Always on top", Bounds = R(12, 404, 200, 22), TabIndex = 50 };
+            topBox = new CheckBox { Text = "Always on top", Bounds = R(12, 404, 130, 22), TabIndex = 50 };
             topBox.CheckedChanged += delegate { TopMost = topBox.Checked; };
+            startBox = new CheckBox { Text = "Start picking when it opens", Bounds = R(150, 404, 300, 22), TabIndex = 51, Checked = true };
+            hotkeyLabel = new Label { Bounds = R(12, 430, 446, 20), ForeColor = SystemColors.GrayText };
 
-            Controls.AddRange(new Control[] { spec, hueBar, preview, hexBtn, copyHint, pickBtn, copyRgbBtn, hexBox, nR, nG, nB, recentPanel, topBox });
+            Controls.AddRange(new Control[] { spec, hueBar, pickBtn, preview, hexBtn, copyHint, copyRgbBtn, hexBox, nR, nG, nB, recentPanel, topBox, startBox, hotkeyLabel });
 
             spec.Changed += delegate { Sa = spec.Sat; V = spec.Val; Sync(spec); };
             hueBar.Changed += delegate { H = hueBar.Hue; Sync(hueBar); };
@@ -548,12 +623,46 @@ namespace ColourPicker
             };
             nR.ValueChanged += numChanged; nG.ValueChanged += numChanged; nB.ValueChanged += numChanged;
 
-            hintTimer.Interval = 1600;
+            hintTimer.Interval = 2500;
             hintTimer.Tick += delegate { hintTimer.Stop(); copyHint.Text = "Click to copy"; copyHint.ForeColor = SystemColors.GrayText; };
 
             LoadSettings();
             RebuildRecent();
             Sync(null);
+        }
+
+        // Global shortcut: Win+Shift+C, or Ctrl+Alt+Shift+C if another app already owns that.
+        protected override void OnHandleCreated(EventArgs e)
+        {
+            base.OnHandleCreated(e);
+            if (Native.RegisterHotKey(Handle, HotkeyId, Native.MOD_WIN | Native.MOD_SHIFT | Native.MOD_NOREPEAT, (uint)Keys.C)) hotkeyName = "Win+Shift+C";
+            else if (Native.RegisterHotKey(Handle, HotkeyId, Native.MOD_CONTROL | Native.MOD_ALT | Native.MOD_SHIFT | Native.MOD_NOREPEAT, (uint)Keys.C)) hotkeyName = "Ctrl+Alt+Shift+C";
+            hotkeyLabel.Text = hotkeyName != null
+                ? hotkeyName + " picks a colour from anywhere while this app is open."
+                : "No keyboard shortcut: Win+Shift+C is taken by another app.";
+            tips.SetToolTip(pickBtn, "Eyedropper: point at anything on any screen and click to pick its colour" + (hotkeyName != null ? " (" + hotkeyName + ")" : ""));
+        }
+
+        protected override void OnHandleDestroyed(EventArgs e)
+        {
+            Native.UnregisterHotKey(Handle, HotkeyId);
+            base.OnHandleDestroyed(e);
+        }
+
+        protected override void WndProc(ref Message m)
+        {
+            if ((m.Msg == Native.WM_HOTKEY && m.WParam.ToInt32() == HotkeyId) || (m.Msg == Program.PickNowMessage && Program.PickNowMessage != 0))
+            {
+                BeginInvoke(new MethodInvoker(Pick));
+                return;
+            }
+            base.WndProc(ref m);
+        }
+
+        protected override void OnShown(EventArgs e)
+        {
+            base.OnShown(e);
+            if (startBox.Checked) BeginInvoke(new MethodInvoker(Pick));
         }
 
         NumericUpDown MakeNum(int x, int tab, string name)
@@ -637,27 +746,25 @@ namespace ColourPicker
 
         void Pick()
         {
+            if (picking) return;
+            picking = true;
+            // Get this window out of the way so whatever is behind it can be picked too.
             Opacity = 0;
+            if (WindowState == FormWindowState.Minimized) WindowState = FormWindowState.Normal;
             Application.DoEvents();
-            System.Threading.Thread.Sleep(200);
             IntPtr prevCtx = IntPtr.Zero;
             try { prevCtx = Native.SetThreadDpiAwarenessContext(Native.PerMonitorAwareV2); }
             catch (EntryPointNotFoundException) { }
-            Bitmap shot = null;
             bool picked = false;
             try
             {
-                Rectangle vs = SystemInformation.VirtualScreen;
-                shot = new Bitmap(vs.Width, vs.Height, PixelFormat.Format32bppRgb);
-                using (Graphics g = Graphics.FromImage(shot))
-                    g.CopyFromScreen(vs.Location, Point.Empty, vs.Size, CopyPixelOperation.SourceCopy);
-                using (PickOverlay ov = new PickOverlay(shot, vs, S))
+                using (Eyedropper ed = new Eyedropper(SystemInformation.VirtualScreen, S))
                 {
-                    if (ov.ShowDialog(this) == DialogResult.OK)
+                    if (ed.ShowDialog(this) == DialogResult.OK)
                     {
-                        SetFrom(ov.Picked, null);
-                        AddRecent(Col.Hex(ov.Picked));
-                        ShowHint("Picked " + Col.Hex(ov.Picked), true);
+                        SetFrom(ed.Picked, null);
+                        AddRecent(Col.Hex(ed.Picked));
+                        ShowHint("Picked " + Col.Hex(ed.Picked), true);
                         picked = true;
                     }
                 }
@@ -670,12 +777,12 @@ namespace ColourPicker
             finally
             {
                 if (prevCtx != IntPtr.Zero) Native.SetThreadDpiAwarenessContext(prevCtx);
-                if (shot != null) shot.Dispose();
                 Opacity = 1;
                 Activate();
+                picking = false;
                 // Ready for another go straight away: one click, Enter or Space picks again.
                 if (picked) pickBtn.Text = "&Pick again";
-                pickBtn.Focus();
+                if (picked) hexBtn.Focus(); else pickBtn.Focus();
             }
         }
 
@@ -737,6 +844,7 @@ namespace ColourPicker
                         Color c;
                         if (k == "last" && Col.TryParseHex(v, out c)) start = c;
                         else if (k == "top") topBox.Checked = v == "1";
+                        else if (k == "pickOnStart") startBox.Checked = v != "0";
                         else if (k == "recent")
                         {
                             foreach (string h in v.Split(','))
@@ -770,6 +878,7 @@ namespace ColourPicker
                 {
                     "last=" + Col.Hex(Current()),
                     "top=" + (topBox.Checked ? "1" : "0"),
+                    "pickOnStart=" + (startBox.Checked ? "1" : "0"),
                     "recent=" + string.Join(",", recent.ToArray()),
                     "pos=" + pos.X + "," + pos.Y
                 });

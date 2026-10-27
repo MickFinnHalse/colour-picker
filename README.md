@@ -1,14 +1,21 @@
 # Colour Picker
 
-A small Windows colour picker that works like the one in PowerPoint. Pick a colour, see its hex code, and click to copy it.
+An eyedropper for Windows that works like the one in PowerPoint. Point at anything on your screen and click to pick its colour. Then click the hex code to copy it.
 
-- Saturation and brightness spectrum with a hue bar
-- Hex and R, G, B fields that stay in sync
+**The eyedropper**
+- Opens straight into eyedropper mode. Move the pointer over anything in any program, on any monitor.
+- A magnifier follows the pointer and shows the colour underneath and its hex code, live as you move.
+- Click (or press Enter) to pick. Arrow keys nudge the pointer by one pixel. Esc or right-click cancels.
+- Pick again with the **Pick again** button, by opening the app again from its shortcut, or with **Win+Shift+C** from anywhere while the app is open. If another app already uses Win+Shift+C, the shortcut is Ctrl+Alt+Shift+C; the app shows which.
+
+**After picking**
 - Click the hex code, or the colour swatch, to copy it (for example `#4472C4`). Ctrl+C works too.
 - **Copy RGB** copies the numbers, for example `68, 114, 196`
-- **Pick from screen** eyedropper with a magnifier. It works across every monitor. Click or press Enter to pick, use the arrow keys to nudge by one pixel, and press Esc to cancel.
+- Saturation and brightness spectrum with a hue bar, and Hex and R, G, B fields that stay in sync
 - Office's ten standard colours, plus your last 12 colours
-- **Always on top**, so the picker stays above PowerPoint, Canva or a browser
+- **Always on top** keeps the window above PowerPoint, Canva or a browser. Untick **Start picking when it opens** to open the window without the eyedropper.
+
+The eyedropper reads the live screen. It doesn't use mouse or keyboard hooks.
 
 Settings and recent colours are saved in `%LOCALAPPDATA%\ColourPicker\settings.txt`.
 
