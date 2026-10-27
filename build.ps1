@@ -3,20 +3,29 @@
 #
 #   build.ps1                 builds into C:\Tools\ColourPicker and creates the shortcuts
 #   build.ps1 -OutDir <path>  builds somewhere else
+#   build.ps1 -Package        builds the downloads for other people into C:\Tools\_dev\ColourPicker-dist
+#                             (or -DistDir <path>): ColourPickerSetup.exe, with the app inside it,
+#                             and ColourPicker-<version>-portable.zip. No shortcuts are touched.
 #
 # CHANGES ON DISK: writes (overwrites) ColourPicker.exe and ColourPicker.ico in the output
 #                  folder, and creates or overwrites "Colour Picker.lnk" on the Desktop and
-#                  in the Start menu. It does not start the app.
+#                  in the Start menu. With -Package, writes only to the dist folder.
+#                  It never starts the app or the installer.
 #
 # Why C:\Tools: it is local disk, and it is the folder AVG has an exception for. Every
 # rebuild is a brand-new executable to an antivirus, and AVG flags new executables it
 # finds anywhere else. (AVG refuses exceptions under AppData.)
 
-param([string]$OutDir = 'C:\Tools\ColourPicker')
+param(
+    [string]$OutDir = 'C:\Tools\ColourPicker',
+    [switch]$Package,
+    [string]$DistDir = 'C:\Tools\_dev\ColourPicker-dist'
+)
 
 $ErrorActionPreference = 'Stop'
 Add-Type -AssemblyName System.Drawing
 
+if ($Package) { $OutDir = $DistDir }
 $root = Split-Path -Parent $MyInvocation.MyCommand.Path
 $csc  = Join-Path $env:WINDIR 'Microsoft.NET\Framework64\v4.0.30319\csc.exe'
 $exe  = Join-Path $OutDir 'ColourPicker.exe'
@@ -24,7 +33,7 @@ $ico  = Join-Path $OutDir 'ColourPicker.ico'
 
 if (-not (Test-Path $csc)) { throw "C# compiler not found at $csc" }
 # A running exe cannot be overwritten, so stop before writing anything.
-if (Get-Process ColourPicker -ErrorAction SilentlyContinue) { throw 'Close Colour Picker first, then run build.ps1 again.' }
+if (-not $Package -and (Get-Process ColourPicker -ErrorAction SilentlyContinue)) { throw 'Close Colour Picker first, then run build.ps1 again.' }
 New-Item -ItemType Directory -Path $OutDir -Force | Out-Null
 
 function Get-HsvColor([double]$h, [double]$s, [double]$v) {
@@ -112,6 +121,22 @@ if (-not $sources) { throw "No .cs files found in $root\src" }
 & $csc /nologo /target:winexe /optimize+ "/out:$exe" "/win32icon:$ico" /r:System.Windows.Forms.dll /r:System.Drawing.dll $sources
 if ($LASTEXITCODE -ne 0) { throw "Compile failed (exit code $LASTEXITCODE)" }
 Write-Output "Compiled: $exe"
+
+if ($Package) {
+    # --- Installer: setup\Setup.cs with the app embedded as a resource ---
+    $setup = Join-Path $OutDir 'ColourPickerSetup.exe'
+    & $csc /nologo /target:winexe /optimize+ "/out:$setup" "/win32icon:$ico" "/resource:$exe,ColourPicker.exe" /r:System.Windows.Forms.dll /r:System.Drawing.dll (Join-Path $root 'setup\Setup.cs')
+    if ($LASTEXITCODE -ne 0) { throw "Installer compile failed (exit code $LASTEXITCODE)" }
+    Write-Output "Installer: $setup"
+
+    # --- Portable zip: just the app; it keeps its settings next to itself ---
+    $version = (Get-Item $exe).VersionInfo.FileVersion -replace '\.0$', ''
+    $zip = Join-Path $OutDir "ColourPicker-$version-portable.zip"
+    if (Test-Path $zip) { Remove-Item $zip }
+    Compress-Archive -Path $exe -DestinationPath $zip
+    Write-Output "Portable zip: $zip"
+    return
+}
 
 # --- Shortcuts ---
 $shell = New-Object -ComObject WScript.Shell
