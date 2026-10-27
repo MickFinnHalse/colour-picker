@@ -17,8 +17,8 @@ using System.Windows.Forms;
 
 [assembly: System.Reflection.AssemblyTitle("Colour Picker")]
 [assembly: System.Reflection.AssemblyProduct("Colour Picker")]
-[assembly: System.Reflection.AssemblyVersion("2.0.0.0")]
-[assembly: System.Reflection.AssemblyFileVersion("2.0.0.0")]
+[assembly: System.Reflection.AssemblyVersion("2.0.1.0")]
+[assembly: System.Reflection.AssemblyFileVersion("2.0.1.0")]
 
 namespace ColourPicker
 {
@@ -48,6 +48,24 @@ namespace ColourPicker
         }
     }
 
+    // A short diagnostic log in %LOCALAPPDATA%\ColourPicker\log.txt, so problems can be traced without guessing.
+    static class Log
+    {
+        static readonly string path = Path.Combine(Environment.GetFolderPath(Environment.SpecialFolder.LocalApplicationData), "ColourPicker", "log.txt");
+
+        public static void Write(string line)
+        {
+            try
+            {
+                Directory.CreateDirectory(Path.GetDirectoryName(path));
+                FileInfo fi = new FileInfo(path);
+                if (fi.Exists && fi.Length > 200000) fi.Delete();
+                File.AppendAllText(path, DateTime.Now.ToString("yyyy-MM-dd HH:mm:ss.fff") + "  " + line + Environment.NewLine);
+            }
+            catch { }
+        }
+    }
+
     static class Program
     {
         public static readonly int PickNowMessage = Native.RegisterWindowMessage("IllumiEd.ColourPicker.PickNow");
@@ -70,6 +88,13 @@ namespace ColourPicker
                     Native.PostMessage(Native.HWND_BROADCAST, PickNowMessage, IntPtr.Zero, IntPtr.Zero);
                     return;
                 }
+                Log.Write("started, version " + Application.ProductVersion);
+                Application.ThreadException += (s, e) =>
+                {
+                    Log.Write("ERROR " + e.Exception);
+                    MessageBox.Show("Something went wrong: " + e.Exception.Message + "\n\nDetails are in %LOCALAPPDATA%\\ColourPicker\\log.txt.", "Colour Picker", MessageBoxButtons.OK, MessageBoxIcon.Warning);
+                };
+                AppDomain.CurrentDomain.UnhandledException += (s, e) => Log.Write("FATAL " + e.ExceptionObject);
                 Application.EnableVisualStyles();
                 Application.SetCompatibleTextRenderingDefault(false);
                 Application.Run(new MainForm());
@@ -320,7 +345,8 @@ namespace ColourPicker
             StartPosition = FormStartPosition.Manual;
             ShowInTaskbar = false;
             ShowIcon = false;
-            TopMost = true;
+            // No TopMost property here: WinForms makes a TopMost form active when it is shown,
+            // which would take focus from the eyedropper. WS_EX_TOPMOST is set in CreateParams instead.
             DoubleBuffered = true;
             Opacity = 0.99; // makes it a layered window, so WS_EX_TRANSPARENT lets clicks pass through
             ClientSize = new Size(N * cell + 2, N * cell + 2 + strip);
@@ -338,7 +364,7 @@ namespace ColourPicker
             get
             {
                 CreateParams cp = base.CreateParams;
-                cp.ExStyle |= 0x20 /* WS_EX_TRANSPARENT */ | 0x80 /* WS_EX_TOOLWINDOW */ | 0x08000000 /* WS_EX_NOACTIVATE */;
+                cp.ExStyle |= 0x08 /* WS_EX_TOPMOST */ | 0x20 /* WS_EX_TRANSPARENT */ | 0x80 /* WS_EX_TOOLWINDOW */ | 0x08000000 /* WS_EX_NOACTIVATE */;
                 return cp;
             }
         }
@@ -438,6 +464,7 @@ namespace ColourPicker
             loupe.Show(this);
             Activate();
             timer.Start();
+            Log.Write("eyedropper shown: bounds " + Bounds + ", magnifier at " + loupe.Bounds + ", active " + (Form.ActiveForm == this));
         }
 
         void Sample()
@@ -456,6 +483,7 @@ namespace ColourPicker
         {
             if (DialogResult != DialogResult.None) return;
             if (result == DialogResult.OK) { Sample(); Picked = loupe.Centre; }
+            Log.Write("eyedropper finished: " + result + (result == DialogResult.OK ? " " + Col.Hex(Picked) : "") + " at " + Cursor.Position);
             DialogResult = result;
         }
 
@@ -468,11 +496,11 @@ namespace ColourPicker
             Finish(e.Button == MouseButtons.Left ? DialogResult.OK : DialogResult.Cancel);
         }
 
-        // If something else takes focus (Alt+Tab, a notification), cancel rather than pick on the next click.
+        // Losing focus does not cancel: the eyedropper stays on top, and Esc or right-click cancels.
         protected override void OnDeactivate(EventArgs e)
         {
             base.OnDeactivate(e);
-            if (Visible) Finish(DialogResult.Cancel);
+            Log.Write("eyedropper lost focus");
         }
 
         protected override bool ProcessCmdKey(ref Message msg, Keys keyData)
@@ -629,14 +657,24 @@ namespace ColourPicker
             LoadSettings();
             RebuildRecent();
             Sync(null);
+            ShowHotkey();
         }
 
         // Global shortcut: Win+Shift+C, or Ctrl+Alt+Shift+C if another app already owns that.
+        // The handle is created early (CreateGraphics at the top of the constructor), before the
+        // controls exist, so this only registers the key; ShowHotkey fills in the label later.
         protected override void OnHandleCreated(EventArgs e)
         {
             base.OnHandleCreated(e);
+            hotkeyName = null;
             if (Native.RegisterHotKey(Handle, HotkeyId, Native.MOD_WIN | Native.MOD_SHIFT | Native.MOD_NOREPEAT, (uint)Keys.C)) hotkeyName = "Win+Shift+C";
             else if (Native.RegisterHotKey(Handle, HotkeyId, Native.MOD_CONTROL | Native.MOD_ALT | Native.MOD_SHIFT | Native.MOD_NOREPEAT, (uint)Keys.C)) hotkeyName = "Ctrl+Alt+Shift+C";
+            ShowHotkey();
+        }
+
+        void ShowHotkey()
+        {
+            if (hotkeyLabel == null || pickBtn == null) return;
             hotkeyLabel.Text = hotkeyName != null
                 ? hotkeyName + " picks a colour from anywhere while this app is open."
                 : "No keyboard shortcut: Win+Shift+C is taken by another app.";
@@ -758,6 +796,7 @@ namespace ColourPicker
             bool picked = false;
             try
             {
+                Log.Write("pick started: virtual screen " + SystemInformation.VirtualScreen + ", per-monitor DPI " + (prevCtx != IntPtr.Zero) + ", scale " + S);
                 using (Eyedropper ed = new Eyedropper(SystemInformation.VirtualScreen, S))
                 {
                     if (ed.ShowDialog(this) == DialogResult.OK)
@@ -771,6 +810,7 @@ namespace ColourPicker
             }
             catch (Exception ex)
             {
+                Log.Write("ERROR in pick: " + ex);
                 ShowHint("Couldn't read the screen", false);
                 tips.SetToolTip(copyHint, ex.Message);
             }
