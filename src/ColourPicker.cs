@@ -17,8 +17,8 @@ using System.Windows.Forms;
 
 [assembly: System.Reflection.AssemblyTitle("Colour Picker")]
 [assembly: System.Reflection.AssemblyProduct("Colour Picker")]
-[assembly: System.Reflection.AssemblyVersion("2.0.1.0")]
-[assembly: System.Reflection.AssemblyFileVersion("2.0.1.0")]
+[assembly: System.Reflection.AssemblyVersion("2.0.2.0")]
+[assembly: System.Reflection.AssemblyFileVersion("2.0.2.0")]
 
 namespace ColourPicker
 {
@@ -48,10 +48,19 @@ namespace ColourPicker
         }
     }
 
-    // A short diagnostic log in %LOCALAPPDATA%\ColourPicker\log.txt, so problems can be traced without guessing.
+    // Settings and the log live next to the exe (C:\Tools\ColourPicker), the folder the antivirus trusts.
+    static class AppFiles
+    {
+        public static readonly string Folder = Path.GetDirectoryName(Application.ExecutablePath);
+        public static readonly string Settings = Path.Combine(Folder, "settings.txt");
+        public static readonly string OldSettings = Path.Combine(Environment.GetFolderPath(Environment.SpecialFolder.LocalApplicationData), "ColourPicker", "settings.txt");
+        public static readonly string LogFile = Path.Combine(Folder, "log.txt");
+    }
+
+    // A short diagnostic log next to the exe, so problems can be traced without guessing.
     static class Log
     {
-        static readonly string path = Path.Combine(Environment.GetFolderPath(Environment.SpecialFolder.LocalApplicationData), "ColourPicker", "log.txt");
+        static readonly string path = AppFiles.LogFile;
 
         public static void Write(string line)
         {
@@ -92,7 +101,7 @@ namespace ColourPicker
                 Application.ThreadException += (s, e) =>
                 {
                     Log.Write("ERROR " + e.Exception);
-                    MessageBox.Show("Something went wrong: " + e.Exception.Message + "\n\nDetails are in %LOCALAPPDATA%\\ColourPicker\\log.txt.", "Colour Picker", MessageBoxButtons.OK, MessageBoxIcon.Warning);
+                    MessageBox.Show("Something went wrong: " + e.Exception.Message + "\n\nDetails are in " + AppFiles.LogFile, "Colour Picker", MessageBoxButtons.OK, MessageBoxIcon.Warning);
                 };
                 AppDomain.CurrentDomain.UnhandledException += (s, e) => Log.Write("FATAL " + e.ExceptionObject);
                 Application.EnableVisualStyles();
@@ -546,7 +555,6 @@ namespace ColourPicker
         bool updating, picking;
         string hotkeyName;
         readonly List<string> recent = new List<string>();
-        readonly string settingsPath = Path.Combine(Environment.GetFolderPath(Environment.SpecialFolder.LocalApplicationData), "ColourPicker", "settings.txt");
 
         SpectrumBox spec;
         HueBar hueBar;
@@ -794,18 +802,13 @@ namespace ColourPicker
             try { prevCtx = Native.SetThreadDpiAwarenessContext(Native.PerMonitorAwareV2); }
             catch (EntryPointNotFoundException) { }
             bool picked = false;
+            Color got = Color.Empty;
             try
             {
                 Log.Write("pick started: virtual screen " + SystemInformation.VirtualScreen + ", per-monitor DPI " + (prevCtx != IntPtr.Zero) + ", scale " + S);
                 using (Eyedropper ed = new Eyedropper(SystemInformation.VirtualScreen, S))
                 {
-                    if (ed.ShowDialog(this) == DialogResult.OK)
-                    {
-                        SetFrom(ed.Picked, null);
-                        AddRecent(Col.Hex(ed.Picked));
-                        ShowHint("Picked " + Col.Hex(ed.Picked), true);
-                        picked = true;
-                    }
+                    if (ed.ShowDialog(this) == DialogResult.OK) { got = ed.Picked; picked = true; }
                 }
             }
             catch (Exception ex)
@@ -820,10 +823,17 @@ namespace ColourPicker
                 Opacity = 1;
                 Activate();
                 picking = false;
-                // Ready for another go straight away: one click, Enter or Space picks again.
-                if (picked) pickBtn.Text = "&Pick again";
-                if (picked) hexBtn.Focus(); else pickBtn.Focus();
             }
+            // Update the window only once it is visible again, so everything repaints.
+            if (picked)
+            {
+                SetFrom(got, null);
+                AddRecent(Col.Hex(got));
+                ShowHint("Picked " + Col.Hex(got), true);
+                pickBtn.Text = "&Pick again"; // one click picks again
+                hexBtn.Focus();               // Enter or Space copies the hex code
+            }
+            else pickBtn.Focus();
         }
 
         void AddRecent(string hex)
@@ -841,10 +851,11 @@ namespace ColourPicker
             recentPanel.SuspendLayout();
             Control[] old = new Control[recentPanel.Controls.Count];
             recentPanel.Controls.CopyTo(old, 0);
-            recentPanel.Controls.Clear();
             foreach (Control c in old)
-                if (c != recentEmpty) { tips.SetToolTip(c, null); c.Dispose(); }
-            if (recent.Count == 0) recentPanel.Controls.Add(recentEmpty);
+                if (c != recentEmpty) { recentPanel.Controls.Remove(c); tips.SetToolTip(c, null); c.Dispose(); }
+            // The "will appear here" note stays in the panel and is shown or hidden, so it always repaints.
+            if (!recentPanel.Controls.Contains(recentEmpty)) recentPanel.Controls.Add(recentEmpty);
+            recentEmpty.Visible = recent.Count == 0;
             for (int i = 0; i < recent.Count; i++)
             {
                 Color c;
@@ -856,6 +867,7 @@ namespace ColourPicker
                 }
             }
             recentPanel.ResumeLayout();
+            recentPanel.Invalidate(true);
             if (hadFocus) hexBtn.Focus();
         }
 
@@ -874,9 +886,12 @@ namespace ColourPicker
             Color start = Color.FromArgb(0x44, 0x72, 0xC4); // Office "Blue, Accent 1"
             try
             {
-                if (File.Exists(settingsPath))
+                // First run of this version: carry over settings from the old location.
+                string from = File.Exists(AppFiles.Settings) ? AppFiles.Settings : AppFiles.OldSettings;
+                if (File.Exists(from))
                 {
-                    foreach (string line in File.ReadAllLines(settingsPath))
+                    Log.Write("loading settings from " + from);
+                    foreach (string line in File.ReadAllLines(from))
                     {
                         int eq = line.IndexOf('=');
                         if (eq < 0) continue;
@@ -904,7 +919,7 @@ namespace ColourPicker
                     }
                 }
             }
-            catch { }
+            catch (Exception ex) { Log.Write("ERROR loading settings: " + ex); }
             SetFrom(start, null);
         }
 
@@ -912,9 +927,8 @@ namespace ColourPicker
         {
             try
             {
-                Directory.CreateDirectory(Path.GetDirectoryName(settingsPath));
                 Point pos = WindowState == FormWindowState.Normal ? Location : RestoreBounds.Location;
-                File.WriteAllLines(settingsPath, new[]
+                File.WriteAllLines(AppFiles.Settings, new[]
                 {
                     "last=" + Col.Hex(Current()),
                     "top=" + (topBox.Checked ? "1" : "0"),
@@ -923,7 +937,7 @@ namespace ColourPicker
                     "pos=" + pos.X + "," + pos.Y
                 });
             }
-            catch { }
+            catch (Exception ex) { Log.Write("ERROR saving settings: " + ex); }
         }
 
         protected override void OnFormClosing(FormClosingEventArgs e)

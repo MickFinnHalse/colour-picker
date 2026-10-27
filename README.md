@@ -17,7 +17,7 @@ An eyedropper for Windows that works like the one in PowerPoint. Point at anythi
 
 The eyedropper reads the live screen. It doesn't use mouse or keyboard hooks.
 
-Settings and recent colours are saved in `%LOCALAPPDATA%\ColourPicker\settings.txt`.
+Settings and recent colours are saved in `settings.txt` next to `ColourPicker.exe`. A short diagnostic log, `log.txt`, is kept there too.
 
 ## Install
 
